@@ -4,6 +4,8 @@ A fully serverless AWS solution for automatically scanning retail brochures (PDF
 
 ## Features
 
+- **Scheduled Automated Crawling**: Downloads brochures from store URLs on a configurable schedule (daily, weekly, etc.)
+- **Deduplication**: Automatically detects and skips duplicate brochures using SHA-256 hash comparison
 - **Automated OCR Processing**: Uses AWS Textract for high-quality optical character recognition
 - **Intelligent Processing**: Automatically chooses between synchronous and asynchronous Textract APIs based on file size and page count
 - **Keyword Detection**: Case-insensitive, whole-word matching with context extraction
@@ -14,11 +16,21 @@ A fully serverless AWS solution for automatically scanning retail brochures (PDF
 
 ## Architecture
 
-The system consists of three main Lambda functions:
+The system consists of four main Lambda functions:
 
-1. **ProcessBrochureLambda**: Triggered by S3 uploads, inspects files, and submits to Textract
-2. **TextractCallbackLambda**: Handles Textract async job completions and stores results
-3. **KeywordSearchLambda**: Searches OCR text for keywords and triggers notifications
+1. **CrawlerLambda**: Scheduled by EventBridge, downloads brochures from URLs with deduplication
+2. **ProcessBrochureLambda**: Triggered by S3 uploads, inspects files, and submits to Textract
+3. **TextractCallbackLambda**: Handles Textract async job completions and stores results
+4. **KeywordSearchLambda**: Searches OCR text for keywords and triggers notifications
+
+### Automated Workflow
+
+1. EventBridge triggers CrawlerLambda on schedule (e.g., daily at 10 AM UTC)
+2. CrawlerLambda downloads brochures from configured URLs
+3. Files are checked for duplicates (SHA-256 hash) and uploaded to S3
+4. S3 upload triggers ProcessBrochureLambda for OCR processing
+5. Textract extracts text and results are searched for keywords
+6. Email notifications sent when keywords are detected
 
 ## Project Structure
 
@@ -30,6 +42,10 @@ brochure-scanner/
 │   │   ├── metrics.py               # CloudWatch metrics
 │   │   ├── aws_clients.py           # AWS SDK clients
 │   │   └── exceptions.py            # Custom exceptions
+│   ├── crawler/                     # CrawlerLambda
+│   │   ├── handler.py
+│   │   ├── downloader.py            # HTTP download with retry
+│   │   └── hash_utils.py            # SHA-256 hashing
 │   ├── process_brochure/            # ProcessBrochureLambda
 │   │   ├── handler.py
 │   │   ├── file_inspector.py
@@ -128,7 +144,34 @@ aws sns subscribe \
 
 ## Usage
 
-### Upload a Brochure
+### Automated Crawling (Primary Mode)
+
+The system automatically downloads brochures from configured URLs on a schedule.
+
+**Crawl Schedule**: By default, runs daily at 10 AM UTC. Configure via `CrawlSchedule` parameter:
+- Daily: `cron(0 10 * * ? *)` (10 AM UTC daily)
+- Weekly on Sundays: `cron(0 10 ? * SUN *)` (10 AM UTC every Sunday)
+- Multiple times per day: `cron(0 */6 * * ? *)` (Every 6 hours)
+
+The crawler will:
+1. Load store configuration from `config/keyword-config.json`
+2. Download brochures from each store's `brochure_url`
+3. Check for duplicates using SHA-256 hash (skips if uploaded in last 30 days)
+4. Upload new brochures to S3
+5. Trigger the processing pipeline automatically
+
+**Trigger manual crawl**:
+```bash
+# Invoke CrawlerLambda manually for testing
+aws lambda invoke \
+  --function-name CrawlerLambda-dev \
+  --payload '{}' \
+  response.json
+```
+
+### Manual Upload (Alternative Mode)
+
+You can also manually upload brochures to S3:
 
 ```bash
 # Upload brochure to S3 (triggers processing automatically)

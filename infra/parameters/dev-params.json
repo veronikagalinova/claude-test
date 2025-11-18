@@ -14,5 +14,9 @@
   {
     "ParameterKey": "LogLevel",
     "ParameterValue": "INFO"
+  },
+  {
+    "ParameterKey": "CrawlSchedule",
+    "ParameterValue": "cron(0 10 * * ? *)"
   }
 ]
