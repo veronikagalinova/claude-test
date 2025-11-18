@@ -5,6 +5,7 @@ A fully serverless AWS solution for automatically scanning retail brochures (PDF
 ## Features
 
 - **Scheduled Automated Crawling**: Downloads brochures from store URLs on a configurable schedule (daily, weekly, etc.)
+- **Web Scraping Capabilities**: Automatically extracts PDF URLs from web pages and embedded viewers (supports Lidl, Issuu, and similar platforms)
 - **Deduplication**: Automatically detects and skips duplicate brochures using SHA-256 hash comparison
 - **Automated OCR Processing**: Uses AWS Textract for high-quality optical character recognition
 - **Intelligent Processing**: Automatically chooses between synchronous and asynchronous Textract APIs based on file size and page count
@@ -45,6 +46,7 @@ brochure-scanner/
 │   ├── crawler/                     # CrawlerLambda
 │   │   ├── handler.py
 │   │   ├── downloader.py            # HTTP download with retry
+│   │   ├── web_scraper.py           # HTML parsing and PDF extraction
 │   │   └── hash_utils.py            # SHA-256 hashing
 │   ├── process_brochure/            # ProcessBrochureLambda
 │   │   ├── handler.py
@@ -156,9 +158,29 @@ The system automatically downloads brochures from configured URLs on a schedule.
 The crawler will:
 1. Load store configuration from `config/keyword-config.json`
 2. Download brochures from each store's `brochure_url`
+   - **Direct download** for PDF/image URLs
+   - **Web scraping** for brochure viewer pages (automatic fallback)
 3. Check for duplicates using SHA-256 hash (skips if uploaded in last 30 days)
 4. Upload new brochures to S3
 5. Trigger the processing pipeline automatically
+
+#### Web Scraping Support
+
+The crawler automatically detects and handles brochure viewer pages:
+- **Direct PDF Links**: Downloads immediately if URL points to PDF
+- **Embedded Viewers**: Extracts PDF URLs from:
+  - JavaScript variables (`pdfUrl`, `file`, `url`)
+  - HTML `<a>` tags with `.pdf` extensions
+  - `<iframe>` embeds and data attributes
+  - JSON-LD structured data
+  - Common viewer patterns (Lidl, Issuu, Yumpu, etc.)
+
+Example URLs supported:
+- Direct: `https://example.com/brochure.pdf`
+- Embedded: `https://www.lidl.bg/l/bg/broshura/...` (extracts PDF from page)
+- Viewer: Any page containing embedded PDF viewers
+
+The crawler logs whether scraping was used and stores both the original page URL and extracted PDF URL in DynamoDB.
 
 **Trigger manual crawl**:
 ```bash

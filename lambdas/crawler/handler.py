@@ -9,7 +9,7 @@ import os
 import json
 import uuid
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from botocore.exceptions import ClientError
 
 import sys
@@ -22,6 +22,7 @@ from common.exceptions import UnsupportedFileFormatError
 
 from downloader import BrochureDownloader, DownloadError
 from hash_utils import compute_file_hash
+from web_scraper import BrochureScraper, ScrapingError
 
 
 # Environment variables
@@ -227,9 +228,9 @@ def process_store(store: Dict) -> Dict:
     )
 
     # Validate URL
-    downloader = BrochureDownloader()
+    temp_downloader = BrochureDownloader()
 
-    if not downloader.validate_url(brochure_url):
+    if not temp_downloader.validate_url(brochure_url):
         logger.error(
             "Invalid brochure URL",
             store_id=store_id,
@@ -242,8 +243,66 @@ def process_store(store: Dict) -> Dict:
         }
 
     try:
-        # Download brochure
-        file_bytes, content_type = downloader.download_file(brochure_url, store_id)
+        # Initialize downloader and scraper
+        downloader = BrochureDownloader()
+        scraper = BrochureScraper()
+
+        file_bytes = None
+        content_type = None
+        actual_download_url = brochure_url
+
+        # Try direct download first
+        try:
+            file_bytes, content_type = downloader.download_file(brochure_url, store_id)
+
+            # Check if we got HTML instead of a PDF/image
+            if content_type and 'text/html' in content_type.lower():
+                logger.info(
+                    "Received HTML content, attempting web scraping",
+                    store_id=store_id,
+                    url=brochure_url
+                )
+                file_bytes = None  # Reset to trigger scraping
+
+        except DownloadError as e:
+            logger.warning(
+                "Direct download failed, attempting web scraping",
+                store_id=store_id,
+                error=str(e)
+            )
+            file_bytes = None  # Will trigger scraping
+
+        # If direct download didn't work, try web scraping
+        if file_bytes is None:
+            try:
+                # Extract actual brochure URL from web page
+                extracted_url, url_type = scraper.extract_brochure_url(brochure_url, store_id)
+
+                logger.info(
+                    "Extracted brochure URL from web page",
+                    original_url=brochure_url,
+                    extracted_url=extracted_url,
+                    url_type=url_type,
+                    store_id=store_id
+                )
+
+                # Download the extracted URL
+                file_bytes, content_type = downloader.download_file(extracted_url, store_id)
+                actual_download_url = extracted_url
+
+                metrics.increment_counter('BrochuresScraped', {'StoreId': store_id})
+
+            except ScrapingError as scrape_err:
+                logger.error(
+                    "Web scraping failed",
+                    store_id=store_id,
+                    error=str(scrape_err)
+                )
+                return {
+                    'store_id': store_id,
+                    'status': 'error',
+                    'error': f"Scraping failed: {str(scrape_err)}"
+                }
 
         # Validate file type
         file_type = detect_file_type(file_bytes)
@@ -276,8 +335,8 @@ def process_store(store: Dict) -> Dict:
         brochure_id = str(uuid.uuid4())
         now = datetime.utcnow()
 
-        # Extract filename from URL or generate one
-        filename = downloader.get_filename_from_url(brochure_url)
+        # Extract filename from actual download URL or generate one
+        filename = downloader.get_filename_from_url(actual_download_url)
         if not filename:
             filename = f"brochure-{now.strftime('%Y%m%d')}.{file_type}"
 
@@ -303,7 +362,8 @@ def process_store(store: Dict) -> Dict:
             s3_key=s3_key,
             file_hash=file_hash,
             file_size=len(file_bytes),
-            source_url=brochure_url
+            source_url=brochure_url,
+            actual_download_url=actual_download_url if actual_download_url != brochure_url else None
         )
 
         logger.info(
@@ -518,7 +578,8 @@ def create_metadata_record(
     s3_key: str,
     file_hash: str,
     file_size: int,
-    source_url: str
+    source_url: str,
+    actual_download_url: Optional[str] = None
 ):
     """
     Create metadata record in DynamoDB.
@@ -552,6 +613,11 @@ def create_metadata_record(
         'created_at': {'S': timestamp},
         'updated_at': {'S': timestamp}
     }
+
+    # Add actual download URL if different from source (indicates scraping was used)
+    if actual_download_url:
+        item['actual_download_url'] = {'S': actual_download_url}
+        item['scraped'] = {'BOOL': True}
 
     try:
         dynamodb_client.put_item(
