@@ -1,0 +1,76 @@
+{
+  "version": "1.0",
+  "updated_at": "2025-11-18T10:00:00Z",
+  "stores": [
+    {
+      "store_id": "walmart",
+      "store_name": "Walmart",
+      "brochure_url": "https://www.walmart.com/weekly-ad.pdf",
+      "keywords": [
+        "organic",
+        "sale",
+        "clearance",
+        "buy one get one",
+        "BOGO",
+        "special offer",
+        "limited time",
+        "fresh",
+        "natural",
+        "discount"
+      ],
+      "recipients": [
+        {
+          "email": "alerts@example.com",
+          "type": "TO"
+        },
+        {
+          "email": "archive@example.com",
+          "type": "BCC"
+        }
+      ],
+      "crawl_schedule": "daily"
+    },
+    {
+      "store_id": "target",
+      "store_name": "Target",
+      "brochure_url": "https://www.target.com/weekly-ad.pdf",
+      "keywords": [
+        "organic",
+        "clearance",
+        "bonus",
+        "free shipping",
+        "exclusive",
+        "new arrival",
+        "save",
+        "deal"
+      ],
+      "recipients": [
+        {
+          "email": "alerts@example.com",
+          "type": "TO"
+        }
+      ],
+      "crawl_schedule": "weekly"
+    },
+    {
+      "store_id": "costco",
+      "store_name": "Costco",
+      "brochure_url": "https://www.costco.com/warehouse-savings.pdf",
+      "keywords": [
+        "organic",
+        "members only",
+        "instant savings",
+        "while supplies last",
+        "limited time offer",
+        "new item"
+      ],
+      "recipients": [
+        {
+          "email": "alerts@example.com",
+          "type": "TO"
+        }
+      ],
+      "crawl_schedule": "weekly"
+    }
+  ]
+}
