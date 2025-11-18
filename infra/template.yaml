@@ -32,6 +32,11 @@ Parameters:
       - ERROR
     Description: Lambda logging level
 
+  CrawlSchedule:
+    Type: String
+    Default: "cron(0 10 * * ? *)"
+    Description: Cron expression for scheduled crawling (default: daily at 10 AM UTC)
+
 Globals:
   Function:
     Runtime: python3.12
@@ -192,6 +197,51 @@ Resources:
 
   # ========== Lambda Functions ==========
 
+  CrawlerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub CrawlerLambda-${Environment}
+      CodeUri: ../lambdas/crawler/
+      Handler: handler.lambda_handler
+      Description: Downloads brochures from store URLs and uploads to S3
+      MemorySize: 512
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          SOURCE_BUCKET_NAME: !Ref BrochuresSourceBucket
+          METADATA_TABLE_NAME: !Ref BrochureMetadataTable
+          CONFIG_BUCKET_NAME: !Ref BrochuresSourceBucket
+          STORE_CONFIG_S3_KEY: config/keyword-config.json
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref BrochuresSourceBucket
+        - S3ReadPolicy:
+            BucketName: !Ref BrochuresSourceBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BrochureMetadataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt CrawlerDLQ.Arn
+      Events:
+        ScheduledCrawl:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref CrawlSchedule
+            Description: Scheduled brochure crawling
+            Enabled: true
+
+  CrawlerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub CrawlerDLQ-${Environment}
+      MessageRetentionPeriod: 1209600
+
   ProcessBrochureLambda:
     Type: AWS::Serverless::Function
     Properties:
@@ -341,6 +391,22 @@ Resources:
 
   # ========== CloudWatch Alarms ==========
 
+  CrawlerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub CrawlerLambda-Errors-${Environment}
+      AlarmDescription: Alert when CrawlerLambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CrawlerLambda
+
   ProcessBrochureErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -444,3 +510,7 @@ Outputs:
   KeywordSearchLambdaArn:
     Description: ARN of KeywordSearchLambda
     Value: !GetAtt KeywordSearchLambda.Arn
+
+  CrawlerLambdaArn:
+    Description: ARN of CrawlerLambda
+    Value: !GetAtt CrawlerLambda.Arn
