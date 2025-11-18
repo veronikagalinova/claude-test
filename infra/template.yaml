@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Brochure Keyword Scanner - MVP Infrastructure
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  SyncPageThreshold:
+    Type: Number
+    Default: 5
+    Description: Maximum page count for synchronous Textract processing
+
+  SyncSizeThresholdMB:
+    Type: Number
+    Default: 5
+    Description: Maximum file size in MB for synchronous processing
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Description: Lambda logging level
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 1024
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+        ENVIRONMENT: !Ref Environment
+
+Resources:
+  # ========== S3 Buckets ==========
+
+  BrochuresSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub brochures-source-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldBrochures
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER_IR
+            ExpirationInDays: 730
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessBrochureLambda.Arn
+
+  TextractOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub textract-output-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveTextractResults
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 180
+                StorageClass: GLACIER_IR
+            ExpirationInDays: 1095
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt KeywordSearchLambda.Arn
+
+  # ========== DynamoDB Table ==========
+
+  BrochureMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub brochure-metadata-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: brochure_id
+          AttributeType: S
+        - AttributeName: store_id
+          AttributeType: S
+        - AttributeName: upload_time
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: file_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: brochure_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: store-date-index
+          KeySchema:
+            - AttributeName: store_id
+              KeyType: HASH
+            - AttributeName: upload_time
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: upload_time
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: hash-index
+          KeySchema:
+            - AttributeName: file_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - brochure_id
+              - s3_key
+              - upload_time
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+
+  # ========== SNS Topics ==========
+
+  TextractJobCompletionTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub textract-job-completion-${Environment}
+      DisplayName: Textract Job Completion Notifications
+      Subscription:
+        - Endpoint: !GetAtt TextractCallbackLambda.Arn
+          Protocol: lambda
+
+  KeywordFoundTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub keyword-found-${Environment}
+      DisplayName: Keyword Match Notifications
+
+  # ========== IAM Roles ==========
+
+  TextractServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub TextractServiceRole-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: textract.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TextractSNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TextractJobCompletionTopic
+
+  # ========== Lambda Functions ==========
+
+  ProcessBrochureLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ProcessBrochureLambda-${Environment}
+      CodeUri: ../lambdas/process_brochure/
+      Handler: handler.lambda_handler
+      Description: Orchestrates Textract OCR processing for uploaded brochures
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          SOURCE_BUCKET_NAME: !Ref BrochuresSourceBucket
+          OUTPUT_BUCKET_NAME: !Ref TextractOutputBucket
+          METADATA_TABLE_NAME: !Ref BrochureMetadataTable
+          TEXTRACT_SNS_TOPIC_ARN: !Ref TextractJobCompletionTopic
+          TEXTRACT_ROLE_ARN: !GetAtt TextractServiceRole.Arn
+          SYNC_PAGE_THRESHOLD: !Ref SyncPageThreshold
+          SYNC_SIZE_THRESHOLD_MB: !Ref SyncSizeThresholdMB
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref BrochuresSourceBucket
+        - S3WritePolicy:
+            BucketName: !Ref TextractOutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BrochureMetadataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:DetectDocumentText
+                - textract:StartDocumentTextDetection
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt TextractServiceRole.Arn
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt ProcessBrochureDLQ.Arn
+
+  ProcessBrochureLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessBrochureLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::brochures-source-${Environment}-${AWS::AccountId}
+
+  ProcessBrochureDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ProcessBrochureDLQ-${Environment}
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  TextractCallbackLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub TextractCallbackLambda-${Environment}
+      CodeUri: ../lambdas/textract_callback/
+      Handler: handler.lambda_handler
+      Description: Handles Textract async job completion notifications
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          OUTPUT_BUCKET_NAME: !Ref TextractOutputBucket
+          METADATA_TABLE_NAME: !Ref BrochureMetadataTable
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref TextractOutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BrochureMetadataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:GetDocumentTextDetection
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt TextractCallbackDLQ.Arn
+
+  TextractCallbackLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TextractCallbackLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref TextractJobCompletionTopic
+
+  TextractCallbackDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub TextractCallbackDLQ-${Environment}
+      MessageRetentionPeriod: 1209600
+
+  KeywordSearchLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub KeywordSearchLambda-${Environment}
+      CodeUri: ../lambdas/keyword_search/
+      Handler: handler.lambda_handler
+      Description: Searches Textract results for keywords and triggers notifications
+      ReservedConcurrentExecutions: 20
+      Environment:
+        Variables:
+          OUTPUT_BUCKET_NAME: !Ref TextractOutputBucket
+          METADATA_TABLE_NAME: !Ref BrochureMetadataTable
+          KEYWORD_FOUND_TOPIC_ARN: !Ref KeywordFoundTopic
+          CONFIG_BUCKET_NAME: !Ref BrochuresSourceBucket
+          KEYWORD_CONFIG_S3_KEY: config/keyword-config.json
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref TextractOutputBucket
+        - S3ReadPolicy:
+            BucketName: !Ref BrochuresSourceBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BrochureMetadataTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt KeywordFoundTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt KeywordSearchDLQ.Arn
+
+  KeywordSearchLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KeywordSearchLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::textract-output-${Environment}-${AWS::AccountId}
+
+  KeywordSearchDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub KeywordSearchDLQ-${Environment}
+      MessageRetentionPeriod: 1209600
+
+  # ========== CloudWatch Alarms ==========
+
+  ProcessBrochureErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ProcessBrochureLambda-Errors-${Environment}
+      AlarmDescription: Alert when ProcessBrochureLambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessBrochureLambda
+
+  TextractCallbackErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub TextractCallbackLambda-Errors-${Environment}
+      AlarmDescription: Alert when TextractCallbackLambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TextractCallbackLambda
+
+  KeywordSearchErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub KeywordSearchLambda-Errors-${Environment}
+      AlarmDescription: Alert when KeywordSearchLambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref KeywordSearchLambda
+
+  DLQMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub DLQ-Messages-${Environment}
+      AlarmDescription: Alert when any DLQ has messages
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessBrochureDLQ.QueueName
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Outputs:
+  BrochuresSourceBucketName:
+    Description: S3 bucket for source brochures
+    Value: !Ref BrochuresSourceBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-BrochuresSourceBucket
+
+  TextractOutputBucketName:
+    Description: S3 bucket for Textract results
+    Value: !Ref TextractOutputBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-TextractOutputBucket
+
+  BrochureMetadataTableName:
+    Description: DynamoDB table for brochure metadata
+    Value: !Ref BrochureMetadataTable
+    Export:
+      Name: !Sub ${AWS::StackName}-BrochureMetadataTable
+
+  KeywordFoundTopicArn:
+    Description: SNS topic ARN for keyword match notifications
+    Value: !Ref KeywordFoundTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-KeywordFoundTopic
+
+  ProcessBrochureLambdaArn:
+    Description: ARN of ProcessBrochureLambda
+    Value: !GetAtt ProcessBrochureLambda.Arn
+
+  TextractCallbackLambdaArn:
+    Description: ARN of TextractCallbackLambda
+    Value: !GetAtt TextractCallbackLambda.Arn
+
+  KeywordSearchLambdaArn:
+    Description: ARN of KeywordSearchLambda
+    Value: !GetAtt KeywordSearchLambda.Arn

@@ -1,0 +1,18 @@
+[
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "SyncPageThreshold",
+    "ParameterValue": "5"
+  },
+  {
+    "ParameterKey": "SyncSizeThresholdMB",
+    "ParameterValue": "5"
+  },
+  {
+    "ParameterKey": "LogLevel",
+    "ParameterValue": "INFO"
+  }
+]
